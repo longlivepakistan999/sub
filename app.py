@@ -109,15 +109,39 @@ def index():
     return render_template("index.html")
 
 
+def parse_domains(raw) -> list[str]:
+    if isinstance(raw, list):
+        items = raw
+    else:
+        items = re.split(r"[\s,;]+", str(raw or ""))
+    seen, out = set(), []
+    for item in items:
+        d = item.strip().lower().lstrip("*.")
+        if d and d not in seen:
+            seen.add(d)
+            out.append(d)
+    return out
+
+
 @app.post("/api/scan")
 def api_scan():
     data = request.get_json(silent=True) or request.form
-    domain = (data.get("domain") or "").strip().lower()
-    if not domain or not DOMAIN_RE.match(domain):
-        return jsonify({"error": "invalid domain"}), 400
-    task = make_task(domain)
-    queue.put(task["id"])
-    return jsonify(task_view(task)), 201
+    raw = data.get("domains") if "domains" in data else data.get("domain")
+    domains = parse_domains(raw)
+    if not domains:
+        return jsonify({"error": "no domain provided"}), 400
+
+    accepted, rejected = [], []
+    for d in domains:
+        if DOMAIN_RE.match(d):
+            task = make_task(d)
+            queue.put(task["id"])
+            accepted.append(task_view(task))
+        else:
+            rejected.append(d)
+    if not accepted:
+        return jsonify({"error": "invalid domain", "rejected": rejected}), 400
+    return jsonify({"accepted": accepted, "rejected": rejected}), 201
 
 
 @app.get("/api/tasks")

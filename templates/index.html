@@ -9,9 +9,9 @@
            max-width: 960px; margin: 2em auto; padding: 0 1em; color: #222; }
     h1 { font-size: 1.4em; margin-bottom: 0.3em; }
     .hint { color: #666; font-size: 0.85em; margin-bottom: 1em; }
-    form { display: flex; gap: 0.5em; margin-bottom: 1.2em; }
-    input[type=text] { flex: 1; padding: 0.55em 0.7em; font-size: 1em;
-                       border: 1px solid #bbb; border-radius: 4px; }
+    form { display: flex; gap: 0.5em; margin-bottom: 1.2em; align-items: flex-start; }
+    textarea { flex: 1; padding: 0.55em 0.7em; font-size: 1em; resize: vertical;
+               border: 1px solid #bbb; border-radius: 4px; font-family: inherit; }
     button { padding: 0.55em 1.2em; font-size: 1em; cursor: pointer;
              background: #2563eb; color: #fff; border: 0; border-radius: 4px; }
     button:hover { background: #1d4ed8; }
@@ -29,10 +29,11 @@
 </head>
 <body>
   <h1>Subfinder Web</h1>
-  <div class="hint">输入域名，提交后排队扫描，完成后可下载结果。</div>
+  <div class="hint">支持一次输入多个域名，用空格、逗号或换行分隔；按提交顺序排队扫描。</div>
 
   <form id="scan-form">
-    <input id="domain" type="text" placeholder="example.com" autocomplete="off" required>
+    <textarea id="domains" rows="4"
+      placeholder="example.com&#10;foo.com, bar.com" required></textarea>
     <button type="submit">扫描</button>
   </form>
 
@@ -64,19 +65,23 @@ function fmtDur(s, e) {
 
 form.addEventListener('submit', async (e) => {
   e.preventDefault();
-  const input = document.getElementById('domain');
-  const domain = input.value.trim();
+  const input = document.getElementById('domains');
+  const domains = input.value.trim();
+  if (!domains) return;
   const res = await fetch('/api/scan', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({domain}),
+    body: JSON.stringify({domains}),
   });
+  const body = await res.json().catch(() => ({}));
   if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    alert(err.error || '提交失败');
+    alert(body.error || '提交失败');
     return;
   }
   input.value = '';
+  if (body.rejected && body.rejected.length) {
+    alert('已忽略无效域名:\n' + body.rejected.join('\n'));
+  }
   refresh();
 });
 
