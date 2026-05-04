@@ -25,6 +25,19 @@
     .status-failed  { color: #b91c1c; }
     .err { font-size: 0.78em; color: #b91c1c; word-break: break-all; }
     a { color: #2563eb; }
+    .summary { background: #f4f6fb; border: 1px solid #dde3f0;
+               border-radius: 4px; padding: 0.7em 0.9em; margin-bottom: 1em;
+               font-size: 0.92em; line-height: 1.5; }
+    .summary .current { font-weight: 600; color: #c2780b; }
+    .progress-bar { height: 6px; background: #e5e7eb; border-radius: 3px;
+                    overflow: hidden; margin-top: 0.5em; }
+    .progress-bar > span { display: block; height: 100%; background: #2563eb;
+                           transition: width 0.3s ease; }
+    .promote-btn { padding: 0.25em 0.6em; font-size: 0.8em;
+                   background: #fff; color: #2563eb; border: 1px solid #2563eb;
+                   border-radius: 3px; cursor: pointer; }
+    .promote-btn:hover { background: #2563eb; color: #fff; }
+    .pos { color: #6b7280; font-size: 0.78em; margin-left: 0.3em; }
   </style>
 </head>
 <body>
@@ -36,6 +49,8 @@
       placeholder="example.com&#10;foo.com, bar.com" required></textarea>
     <button type="submit">扫描</button>
   </form>
+
+  <div id="summary" class="summary" style="display:none"></div>
 
   <table>
     <thead>
@@ -50,6 +65,7 @@
 <script>
 const form = document.getElementById('scan-form');
 const tbody = document.getElementById('tasks');
+const summaryEl = document.getElementById('summary');
 
 function esc(s) {
   return String(s ?? '').replace(/[&<>"']/g, c => ({
@@ -85,25 +101,59 @@ form.addEventListener('submit', async (e) => {
   refresh();
 });
 
+async function promoteTask(tid) {
+  const res = await fetch(`/api/tasks/${encodeURIComponent(tid)}/promote`, {method:'POST'});
+  if (!res.ok) {
+    const err = await res.json().catch(()=>({}));
+    alert(err.error || '提前失败');
+  }
+  refresh();
+}
+window.promoteTask = promoteTask;
+
+function renderSummary(s) {
+  if (!s || s.total === 0) { summaryEl.style.display = 'none'; return; }
+  summaryEl.style.display = '';
+  const pct = s.total ? Math.round(s.finished * 100 / s.total) : 0;
+  const cur = s.current_domain
+    ? `<span class="current">正在扫描: ${esc(s.current_domain)}</span>`
+    : (s.queued ? '等待中…' : '空闲');
+  summaryEl.innerHTML = `
+    <div>总进度: ${s.finished} / ${s.total}
+      （完成 ${s.done}，失败 ${s.failed}，排队 ${s.queued}） · ${cur}</div>
+    <div class="progress-bar"><span style="width:${pct}%"></span></div>
+  `;
+}
+
 async function refresh() {
   try {
     const res = await fetch('/api/tasks');
     const data = await res.json();
-    tbody.innerHTML = data.map(t => `
-      <tr>
-        <td>${esc(t.domain)}</td>
-        <td class="status-${esc(t.status)}">
-          ${esc(t.status)}
-          ${t.error ? `<div class="err">${esc(t.error)}</div>` : ''}
-        </td>
-        <td>${t.count}</td>
-        <td>${fmtTime(t.created_at)}</td>
-        <td>${fmtDur(t.started_at, t.finished_at)}</td>
-        <td>${t.status === 'done'
-            ? `<a href="/api/tasks/${esc(t.id)}/download">下载</a>`
-            : ''}</td>
-      </tr>
-    `).join('');
+    renderSummary(data.summary);
+    tbody.innerHTML = data.tasks.map(t => {
+      const statusCell = t.status === 'queued' && t.position
+        ? `${esc(t.status)}<span class="pos">#${t.position}</span>`
+        : esc(t.status);
+      let action = '';
+      if (t.status === 'done') {
+        action = `<a href="/api/tasks/${esc(t.id)}/download">下载</a>`;
+      } else if (t.status === 'queued' && t.position && t.position > 1) {
+        action = `<button class="promote-btn"
+                          onclick="promoteTask('${esc(t.id)}')">提前</button>`;
+      }
+      return `
+        <tr>
+          <td>${esc(t.domain)}</td>
+          <td class="status-${esc(t.status)}">
+            ${statusCell}
+            ${t.error ? `<div class="err">${esc(t.error)}</div>` : ''}
+          </td>
+          <td>${t.count}</td>
+          <td>${fmtTime(t.created_at)}</td>
+          <td>${fmtDur(t.started_at, t.finished_at)}</td>
+          <td>${action}</td>
+        </tr>`;
+    }).join('');
   } catch (e) { /* ignore transient errors */ }
 }
 

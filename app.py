@@ -5,7 +5,6 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from queue import Queue
 
 from flask import Flask, abort, jsonify, render_template, request, send_file
 
@@ -22,7 +21,25 @@ app = Flask(__name__)
 
 tasks: dict[str, dict] = {}
 tasks_lock = threading.Lock()
-queue: Queue = Queue()
+
+pending: list[str] = []
+pending_cv = threading.Condition()
+current_tid: str | None = None
+
+
+def enqueue(tid: str) -> None:
+    with pending_cv:
+        pending.append(tid)
+        pending_cv.notify()
+
+
+def promote(tid: str) -> bool:
+    with pending_cv:
+        if tid in pending:
+            pending.remove(tid)
+            pending.insert(0, tid)
+            return True
+        return False
 
 
 def task_view(t: dict) -> dict:
@@ -90,15 +107,21 @@ def run_scan(task: dict) -> None:
 
 
 def worker() -> None:
+    global current_tid
     while True:
-        tid = queue.get()
+        with pending_cv:
+            while not pending:
+                pending_cv.wait()
+            tid = pending.pop(0)
+            current_tid = tid
         try:
             with tasks_lock:
                 task = tasks.get(tid)
             if task:
                 run_scan(task)
         finally:
-            queue.task_done()
+            with pending_cv:
+                current_tid = None
 
 
 threading.Thread(target=worker, daemon=True).start()
@@ -135,7 +158,7 @@ def api_scan():
     for d in domains:
         if DOMAIN_RE.match(d):
             task = make_task(d)
-            queue.put(task["id"])
+            enqueue(task["id"])
             accepted.append(task_view(task))
         else:
             rejected.append(d)
@@ -148,7 +171,48 @@ def api_scan():
 def api_tasks():
     with tasks_lock:
         items = sorted(tasks.values(), key=lambda t: t["created_at"], reverse=True)
-    return jsonify([task_view(t) for t in items])
+    with pending_cv:
+        order = list(pending)
+        running_id = current_tid
+    pos = {tid: i + 1 for i, tid in enumerate(order)}
+
+    counts = {"queued": 0, "running": 0, "done": 0, "failed": 0}
+    current_domain = None
+    for t in items:
+        counts[t["status"]] = counts.get(t["status"], 0) + 1
+        if t["id"] == running_id:
+            current_domain = t["domain"]
+
+    summary = {
+        "total": len(items),
+        "queued": counts["queued"],
+        "running": counts["running"],
+        "done": counts["done"],
+        "failed": counts["failed"],
+        "finished": counts["done"] + counts["failed"],
+        "current_domain": current_domain,
+    }
+
+    out = []
+    for t in items:
+        v = task_view(t)
+        if t["status"] == "queued":
+            v["position"] = pos.get(t["id"])
+        out.append(v)
+    return jsonify({"summary": summary, "tasks": out})
+
+
+@app.post("/api/tasks/<tid>/promote")
+def api_promote(tid):
+    with tasks_lock:
+        task = tasks.get(tid)
+    if not task:
+        abort(404)
+    if task["status"] != "queued":
+        return jsonify({"error": "task is not queued"}), 400
+    if not promote(tid):
+        return jsonify({"error": "task not in queue"}), 400
+    return jsonify({"ok": True})
 
 
 @app.get("/api/tasks/<tid>")
