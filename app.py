@@ -5,6 +5,7 @@ import os
 import re
 import signal
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -31,7 +32,12 @@ def load_config() -> None:
         return
     try:
         data = json.loads(CONFIG_FILE.read_text())
-    except Exception:
+    except Exception as e:
+        print(
+            f"warning: could not parse {CONFIG_FILE} ({e}); "
+            "falling back to defaults — re-save from the UI to overwrite it",
+            file=sys.stderr,
+        )
         return
     bin_path = data.get("subfinder_bin")
     if isinstance(bin_path, str) and bin_path.strip():
@@ -93,12 +99,6 @@ pending_cv = threading.Condition()
 current_tid: str | None = None
 
 
-def enqueue(tid: str) -> None:
-    with pending_cv:
-        pending.append(tid)
-        pending_cv.notify()
-
-
 def promote(tid: str) -> bool:
     with pending_cv:
         if tid in pending:
@@ -122,6 +122,8 @@ def task_view(t: dict) -> dict:
 
 
 def make_task(domain: str) -> dict:
+    """Register a new task and enqueue it atomically so concurrent readers
+    never see a task that exists in `tasks` but is missing from `pending`."""
     tid = uuid.uuid4().hex[:12]
     task = {
         "id": tid,
@@ -136,6 +138,9 @@ def make_task(domain: str) -> dict:
     }
     with tasks_lock:
         tasks[tid] = task
+        with pending_cv:
+            pending.append(tid)
+            pending_cv.notify()
     return task
 
 
@@ -160,13 +165,22 @@ def run_scan(task: dict) -> None:
     output_file = task["output_file"]
     bin_path = get_subfinder_bin()
     try:
-        proc = subprocess.Popen(
-            [bin_path, "-d", task["domain"], "-o", output_file, "-silent"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            start_new_session=True,
-        )
+        try:
+            proc = subprocess.Popen(
+                [bin_path, "-d", task["domain"], "-o", output_file, "-silent"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                start_new_session=True,
+            )
+        except FileNotFoundError:
+            update_task(
+                task,
+                status="failed",
+                error=f"subfinder binary not found: {bin_path} (set it on the page or via SUBFINDER_BIN)",
+            )
+            return
+
         # Publish proc handle, then check whether stop was requested in
         # the tiny window between dequeue and Popen.
         with tasks_lock:
@@ -199,12 +213,6 @@ def run_scan(task: dict) -> None:
         with open(output_file) as f:
             lines = [ln.strip() for ln in f if ln.strip()]
         update_task(task, count=len(lines), status="done")
-    except FileNotFoundError:
-        update_task(
-            task,
-            status="failed",
-            error=f"subfinder binary not found: {bin_path} (set it on the page or via SUBFINDER_BIN)",
-        )
     except Exception as e:
         update_task(task, status="failed", error=str(e))
     finally:
@@ -217,19 +225,25 @@ def run_scan(task: dict) -> None:
 def worker() -> None:
     global current_tid
     while True:
-        with pending_cv:
-            while not pending:
-                pending_cv.wait()
-            tid = pending.pop(0)
-            current_tid = tid
+        tid = None
         try:
-            with tasks_lock:
-                task = tasks.get(tid)
-            if task:
-                run_scan(task)
-        finally:
             with pending_cv:
-                current_tid = None
+                while not pending:
+                    pending_cv.wait()
+                tid = pending.pop(0)
+                current_tid = tid
+            try:
+                with tasks_lock:
+                    task = tasks.get(tid)
+                if task:
+                    run_scan(task)
+            finally:
+                with pending_cv:
+                    current_tid = None
+        except Exception as e:
+            # Never let the worker thread die — without it queued tasks
+            # would silently stop processing while the server stayed up.
+            print(f"worker error processing tid={tid}: {e!r}", file=sys.stderr)
 
 
 threading.Thread(target=worker, daemon=True).start()
@@ -295,7 +309,6 @@ def api_scan():
     for d in domains:
         if DOMAIN_RE.match(d):
             task = make_task(d)
-            enqueue(task["id"])
             accepted.append(task_view(task))
         else:
             rejected.append(d)
@@ -384,10 +397,14 @@ def api_stop(tid):
         )
         return jsonify({"ok": True})
 
-    # Already running (or just dequeued). Mark intent and signal the proc.
+    # Already running (or just dequeued). Re-check status under the lock
+    # so we don't strand a stale flag on a task the worker just finalized.
     with tasks_lock:
-        task["_stop_requested"] = True
-        proc = task.get("_proc")
+        if task["status"] in ("queued", "running"):
+            task["_stop_requested"] = True
+            proc = task.get("_proc")
+        else:
+            proc = None
     if proc is not None:
         kill_proc_group(proc)
     return jsonify({"ok": True})
