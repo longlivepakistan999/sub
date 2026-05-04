@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 import os
 import re
@@ -39,7 +41,9 @@ def load_config() -> None:
 def save_config() -> None:
     with config_lock:
         snapshot = dict(config)
-    CONFIG_FILE.write_text(json.dumps(snapshot, indent=2))
+    tmp = CONFIG_FILE.with_suffix(CONFIG_FILE.suffix + ".tmp")
+    tmp.write_text(json.dumps(snapshot, indent=2))
+    os.replace(tmp, CONFIG_FILE)
 
 
 def get_subfinder_bin() -> str:
@@ -54,11 +58,13 @@ def probe_subfinder(path: str) -> dict:
             [path, "-version"], capture_output=True, text=True, timeout=5,
         )
         out = (proc.stderr or proc.stdout or "").strip()
-        if proc.returncode == 0:
-            result["ok"] = True
-            result["version"] = out[:200] or "ok"
-        else:
+        if proc.returncode != 0:
             result["error"] = (out or f"exit {proc.returncode}")[:200]
+        elif "subfinder" not in out.lower():
+            result["error"] = f"binary did not identify as subfinder: {out[:200] or '(no output)'}"
+        else:
+            result["ok"] = True
+            result["version"] = out[:200]
     except FileNotFoundError:
         result["error"] = "binary not found"
     except subprocess.TimeoutExpired:
@@ -267,6 +273,15 @@ def api_tasks():
         running_id = current_tid
     pos = {tid: i + 1 for i, tid in enumerate(order)}
 
+    # current_tid is set the moment the worker pops a task from pending,
+    # which can be a tick before run_scan flips its status to "running".
+    # Treat the popped task as running so the summary stays consistent.
+    if running_id:
+        for t in snapshots:
+            if t["id"] == running_id and t["status"] == "queued":
+                t["status"] = "running"
+                break
+
     counts = {"queued": 0, "running": 0, "done": 0, "failed": 0}
     current_domain = None
     for t in snapshots:
@@ -318,15 +333,17 @@ def api_task(tid):
 def download(tid):
     with tasks_lock:
         task = tasks.get(tid)
-    if not task:
+        if task and task["status"] == "done":
+            output_file = task["output_file"]
+            download_name = f"{task['domain']}-subdomains.txt"
+        else:
+            output_file = None
+    if not output_file:
         abort(404)
-    if task["status"] != "done" or not os.path.exists(task["output_file"]):
+    try:
+        return send_file(output_file, as_attachment=True, download_name=download_name)
+    except FileNotFoundError:
         abort(404)
-    return send_file(
-        task["output_file"],
-        as_attachment=True,
-        download_name=f"{task['domain']}-subdomains.txt",
-    )
 
 
 if __name__ == "__main__":
