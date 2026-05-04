@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import signal
 import subprocess
 import threading
 import time
@@ -38,12 +39,16 @@ def load_config() -> None:
             config["subfinder_bin"] = bin_path.strip()
 
 
-def save_config() -> None:
-    with config_lock:
-        snapshot = dict(config)
+def _persist_config_locked(snapshot: dict) -> None:
+    """Write config atomically. Caller must serialize (e.g. hold config_lock)."""
     tmp = CONFIG_FILE.with_suffix(CONFIG_FILE.suffix + ".tmp")
     tmp.write_text(json.dumps(snapshot, indent=2))
     os.replace(tmp, CONFIG_FILE)
+
+
+def save_config() -> None:
+    with config_lock:
+        _persist_config_locked(dict(config))
 
 
 def get_subfinder_bin() -> str:
@@ -139,19 +144,54 @@ def update_task(task: dict, **fields) -> None:
         task.update(fields)
 
 
+def kill_proc_group(proc: subprocess.Popen) -> None:
+    """SIGKILL the process group so children inheriting the pipes also die."""
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, OSError):
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
 def run_scan(task: dict) -> None:
     update_task(task, status="running", started_at=time.time())
     output_file = task["output_file"]
     bin_path = get_subfinder_bin()
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             [bin_path, "-d", task["domain"], "-o", output_file, "-silent"],
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=SCAN_TIMEOUT,
+            start_new_session=True,
         )
+        # Publish proc handle, then check whether stop was requested in
+        # the tiny window between dequeue and Popen.
+        with tasks_lock:
+            task["_proc"] = proc
+            stop_now = task.get("_stop_requested", False)
+        if stop_now:
+            kill_proc_group(proc)
+        try:
+            stdout, stderr = proc.communicate(timeout=SCAN_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            kill_proc_group(proc)
+            try:
+                proc.communicate(timeout=5)
+            except Exception:
+                pass
+            update_task(task, status="failed", error=f"scan timeout after {SCAN_TIMEOUT}s")
+            return
+
+        with tasks_lock:
+            was_stopped = task.get("_stop_requested", False)
+        if was_stopped:
+            update_task(task, status="stopped", error="cancelled by user")
+            return
         if proc.returncode != 0:
-            err = (proc.stderr or proc.stdout or "subfinder failed").strip()[:1000]
+            err = (stderr or stdout or "subfinder failed").strip()[:1000]
             update_task(task, status="failed", error=err)
             return
         if not os.path.exists(output_file):
@@ -165,11 +205,12 @@ def run_scan(task: dict) -> None:
             status="failed",
             error=f"subfinder binary not found: {bin_path} (set it on the page or via SUBFINDER_BIN)",
         )
-    except subprocess.TimeoutExpired:
-        update_task(task, status="failed", error=f"scan timeout after {SCAN_TIMEOUT}s")
     except Exception as e:
         update_task(task, status="failed", error=str(e))
     finally:
+        with tasks_lock:
+            task.pop("_proc", None)
+            task.pop("_stop_requested", None)
         update_task(task, finished_at=time.time())
 
 
@@ -219,10 +260,10 @@ def api_config_set():
         return jsonify(probe), 400
     with config_lock:
         config["subfinder_bin"] = bin_path
-    try:
-        save_config()
-    except Exception as e:
-        return jsonify({"error": f"saved in memory but failed to persist: {e}"}), 500
+        try:
+            _persist_config_locked(dict(config))
+        except Exception as e:
+            return jsonify({"error": f"saved in memory but failed to persist: {e}"}), 500
     return jsonify(probe)
 
 
@@ -282,7 +323,7 @@ def api_tasks():
                 t["status"] = "running"
                 break
 
-    counts = {"queued": 0, "running": 0, "done": 0, "failed": 0}
+    counts = {"queued": 0, "running": 0, "done": 0, "failed": 0, "stopped": 0}
     current_domain = None
     for t in snapshots:
         counts[t["status"]] = counts.get(t["status"], 0) + 1
@@ -295,7 +336,8 @@ def api_tasks():
         "running": counts["running"],
         "done": counts["done"],
         "failed": counts["failed"],
-        "finished": counts["done"] + counts["failed"],
+        "stopped": counts["stopped"],
+        "finished": counts["done"] + counts["failed"] + counts["stopped"],
         "current_domain": current_domain,
     }
 
@@ -312,10 +354,77 @@ def api_promote(tid):
         status = task["status"] if task else None
     if not task:
         abort(404)
-    if status != "queued":
-        return jsonify({"error": "task is not queued"}), 400
-    if not promote(tid):
-        return jsonify({"error": "task not in queue"}), 400
+    if status != "queued" or not promote(tid):
+        return jsonify({"error": "task is no longer queued (already running or finished)"}), 400
+    return jsonify({"ok": True})
+
+
+@app.post("/api/tasks/<tid>/stop")
+def api_stop(tid):
+    with tasks_lock:
+        task = tasks.get(tid)
+        if not task:
+            abort(404)
+        status = task["status"]
+    if status not in ("queued", "running"):
+        return jsonify({"error": "task is not active"}), 400
+
+    # Try cancelling from the queue first.
+    removed = False
+    with pending_cv:
+        if tid in pending:
+            pending.remove(tid)
+            removed = True
+    if removed:
+        update_task(
+            task,
+            status="stopped",
+            error="cancelled before start",
+            finished_at=time.time(),
+        )
+        return jsonify({"ok": True})
+
+    # Already running (or just dequeued). Mark intent and signal the proc.
+    with tasks_lock:
+        task["_stop_requested"] = True
+        proc = task.get("_proc")
+    if proc is not None:
+        kill_proc_group(proc)
+    return jsonify({"ok": True})
+
+
+@app.delete("/api/tasks/<tid>")
+def api_delete(tid):
+    with tasks_lock:
+        task = tasks.get(tid)
+        if not task:
+            abort(404)
+        status = task["status"]
+        output_file = task.get("output_file")
+    if status == "running":
+        return jsonify({"error": "stop the task before deleting"}), 400
+
+    if status == "queued":
+        with pending_cv:
+            try:
+                pending.remove(tid)
+            except ValueError:
+                pass
+
+    if output_file:
+        try:
+            os.unlink(output_file)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+
+    with tasks_lock:
+        # Re-check: if a race made it 'running' between our checks, refuse.
+        cur = tasks.get(tid)
+        if cur and cur["status"] == "running":
+            return jsonify({"error": "task started running; stop it first"}), 400
+        tasks.pop(tid, None)
     return jsonify({"ok": True})
 
 

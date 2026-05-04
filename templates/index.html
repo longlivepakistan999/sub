@@ -23,6 +23,7 @@
     .status-running { color: #c2780b; }
     .status-done    { color: #047857; }
     .status-failed  { color: #b91c1c; }
+    .status-stopped { color: #6b7280; font-style: italic; }
     .err { font-size: 0.78em; color: #b91c1c; word-break: break-all; }
     a { color: #2563eb; }
     .summary { background: #f4f6fb; border: 1px solid #dde3f0;
@@ -33,10 +34,14 @@
                     overflow: hidden; margin-top: 0.5em; }
     .progress-bar > span { display: block; height: 100%; background: #2563eb;
                            transition: width 0.3s ease; }
-    .promote-btn { padding: 0.25em 0.6em; font-size: 0.8em;
-                   background: #fff; color: #2563eb; border: 1px solid #2563eb;
-                   border-radius: 3px; cursor: pointer; }
-    .promote-btn:hover { background: #2563eb; color: #fff; }
+    .row-btn { padding: 0.25em 0.6em; font-size: 0.8em; background: #fff;
+               border-radius: 3px; cursor: pointer; margin-right: 0.25em; }
+    .btn-promote { color: #2563eb; border: 1px solid #2563eb; }
+    .btn-promote:hover { background: #2563eb; color: #fff; }
+    .btn-stop    { color: #c2780b; border: 1px solid #c2780b; }
+    .btn-stop:hover    { background: #c2780b; color: #fff; }
+    .btn-delete  { color: #b91c1c; border: 1px solid #b91c1c; }
+    .btn-delete:hover  { background: #b91c1c; color: #fff; }
     .pos { color: #6b7280; font-size: 0.78em; margin-left: 0.3em; }
     details.settings { background: #fafafa; border: 1px solid #e5e7eb;
                        border-radius: 4px; padding: 0.4em 0.7em; margin-bottom: 1em;
@@ -125,15 +130,32 @@ form.addEventListener('submit', async (e) => {
   refresh();
 });
 
-async function promoteTask(tid) {
-  const res = await fetch(`/api/tasks/${encodeURIComponent(tid)}/promote`, {method:'POST'});
+async function postAction(url, failMsg) {
+  const res = await fetch(url, {method:'POST'});
   if (!res.ok) {
     const err = await res.json().catch(()=>({}));
-    alert(err.error || '提前失败');
+    alert(err.error || failMsg);
+  }
+  refresh();
+}
+async function promoteTask(tid) {
+  postAction(`/api/tasks/${encodeURIComponent(tid)}/promote`, '提前失败');
+}
+async function stopTask(tid) {
+  postAction(`/api/tasks/${encodeURIComponent(tid)}/stop`, '停止失败');
+}
+async function deleteTask(tid, domain) {
+  if (!confirm(`确认删除任务: ${domain}?`)) return;
+  const res = await fetch(`/api/tasks/${encodeURIComponent(tid)}`, {method:'DELETE'});
+  if (!res.ok) {
+    const err = await res.json().catch(()=>({}));
+    alert(err.error || '删除失败');
   }
   refresh();
 }
 window.promoteTask = promoteTask;
+window.stopTask = stopTask;
+window.deleteTask = deleteTask;
 
 function renderSummary(s) {
   if (!s || s.total === 0) { summaryEl.style.display = 'none'; return; }
@@ -144,7 +166,7 @@ function renderSummary(s) {
     : (s.queued ? '等待中…' : '空闲');
   summaryEl.innerHTML = `
     <div>总进度: ${s.finished} / ${s.total}
-      （完成 ${s.done}，失败 ${s.failed}，排队 ${s.queued}） · ${cur}</div>
+      （完成 ${s.done}，失败 ${s.failed}，停止 ${s.stopped || 0}，排队 ${s.queued}） · ${cur}</div>
     <div class="progress-bar"><span style="width:${pct}%"></span></div>
   `;
 }
@@ -158,16 +180,27 @@ async function refresh() {
       const statusCell = t.status === 'queued' && t.position
         ? `${esc(t.status)}<span class="pos">#${t.position}</span>`
         : esc(t.status);
-      let action = '';
+      const id = esc(t.id);
+      const dom = esc(t.domain);
+      const actions = [];
       if (t.status === 'done') {
-        action = `<a href="/api/tasks/${esc(t.id)}/download">下载</a>`;
-      } else if (t.status === 'queued' && t.position && t.position > 1) {
-        action = `<button class="promote-btn"
-                          onclick="promoteTask('${esc(t.id)}')">提前</button>`;
+        actions.push(`<a href="/api/tasks/${id}/download">下载</a>`);
+      }
+      if (t.status === 'queued' && t.position && t.position > 1) {
+        actions.push(`<button class="row-btn btn-promote"
+          onclick="promoteTask('${id}')">提前</button>`);
+      }
+      if (t.status === 'queued' || t.status === 'running') {
+        actions.push(`<button class="row-btn btn-stop"
+          onclick="stopTask('${id}')">停止</button>`);
+      }
+      if (t.status !== 'running') {
+        actions.push(`<button class="row-btn btn-delete"
+          onclick="deleteTask('${id}', '${dom}')">删除</button>`);
       }
       return `
         <tr>
-          <td>${esc(t.domain)}</td>
+          <td>${dom}</td>
           <td class="status-${esc(t.status)}">
             ${statusCell}
             ${t.error ? `<div class="err">${esc(t.error)}</div>` : ''}
@@ -175,7 +208,7 @@ async function refresh() {
           <td>${t.count}</td>
           <td>${fmtTime(t.created_at)}</td>
           <td>${fmtDur(t.started_at, t.finished_at)}</td>
-          <td>${action}</td>
+          <td>${actions.join(' ')}</td>
         </tr>`;
     }).join('');
   } catch (e) { /* ignore transient errors */ }
