@@ -16,6 +16,7 @@ DOMAIN_RE = re.compile(
     r"^(?=.{1,253}$)(?!-)[A-Za-z0-9-]{1,63}(?<!-)(\.(?!-)[A-Za-z0-9-]{1,63}(?<!-))+$"
 )
 SCAN_TIMEOUT = int(os.environ.get("SCAN_TIMEOUT", "1800"))
+SUBFINDER_BIN = os.environ.get("SUBFINDER_BIN", "subfinder")
 
 app = Flask(__name__)
 
@@ -83,7 +84,7 @@ def run_scan(task: dict) -> None:
     output_file = task["output_file"]
     try:
         proc = subprocess.run(
-            ["subfinder", "-d", task["domain"], "-o", output_file, "-silent"],
+            [SUBFINDER_BIN, "-d", task["domain"], "-o", output_file, "-silent"],
             capture_output=True,
             text=True,
             timeout=SCAN_TIMEOUT,
@@ -98,7 +99,11 @@ def run_scan(task: dict) -> None:
             lines = [ln.strip() for ln in f if ln.strip()]
         update_task(task, count=len(lines), status="done")
     except FileNotFoundError:
-        update_task(task, status="failed", error="subfinder binary not found in PATH")
+        update_task(
+            task,
+            status="failed",
+            error=f"subfinder binary not found: {SUBFINDER_BIN} (set SUBFINDER_BIN to override)",
+        )
     except subprocess.TimeoutExpired:
         update_task(task, status="failed", error=f"scan timeout after {SCAN_TIMEOUT}s")
     except Exception as e:
