@@ -73,9 +73,13 @@ def make_task(domain: str) -> dict:
     return task
 
 
+def update_task(task: dict, **fields) -> None:
+    with tasks_lock:
+        task.update(fields)
+
+
 def run_scan(task: dict) -> None:
-    task["status"] = "running"
-    task["started_at"] = time.time()
+    update_task(task, status="running", started_at=time.time())
     output_file = task["output_file"]
     try:
         proc = subprocess.run(
@@ -85,25 +89,22 @@ def run_scan(task: dict) -> None:
             timeout=SCAN_TIMEOUT,
         )
         if proc.returncode != 0:
-            task["status"] = "failed"
-            task["error"] = (proc.stderr or proc.stdout or "subfinder failed").strip()[:1000]
+            err = (proc.stderr or proc.stdout or "subfinder failed").strip()[:1000]
+            update_task(task, status="failed", error=err)
             return
-        if os.path.exists(output_file):
-            with open(output_file) as f:
-                lines = [ln.strip() for ln in f if ln.strip()]
-            task["count"] = len(lines)
-        task["status"] = "done"
+        if not os.path.exists(output_file):
+            open(output_file, "w").close()
+        with open(output_file) as f:
+            lines = [ln.strip() for ln in f if ln.strip()]
+        update_task(task, count=len(lines), status="done")
     except FileNotFoundError:
-        task["status"] = "failed"
-        task["error"] = "subfinder binary not found in PATH"
+        update_task(task, status="failed", error="subfinder binary not found in PATH")
     except subprocess.TimeoutExpired:
-        task["status"] = "failed"
-        task["error"] = f"scan timeout after {SCAN_TIMEOUT}s"
+        update_task(task, status="failed", error=f"scan timeout after {SCAN_TIMEOUT}s")
     except Exception as e:
-        task["status"] = "failed"
-        task["error"] = str(e)
+        update_task(task, status="failed", error=str(e))
     finally:
-        task["finished_at"] = time.time()
+        update_task(task, finished_at=time.time())
 
 
 def worker() -> None:
@@ -139,7 +140,9 @@ def parse_domains(raw) -> list[str]:
         items = re.split(r"[\s,;]+", str(raw or ""))
     seen, out = set(), []
     for item in items:
-        d = item.strip().lower().lstrip("*.")
+        d = item.strip().lower()
+        if d.startswith("*."):
+            d = d[2:]
         if d and d not in seen:
             seen.add(d)
             out.append(d)
@@ -170,7 +173,8 @@ def api_scan():
 @app.get("/api/tasks")
 def api_tasks():
     with tasks_lock:
-        items = sorted(tasks.values(), key=lambda t: t["created_at"], reverse=True)
+        snapshots = [task_view(t) for t in tasks.values()]
+    snapshots.sort(key=lambda t: t["created_at"], reverse=True)
     with pending_cv:
         order = list(pending)
         running_id = current_tid
@@ -178,13 +182,13 @@ def api_tasks():
 
     counts = {"queued": 0, "running": 0, "done": 0, "failed": 0}
     current_domain = None
-    for t in items:
+    for t in snapshots:
         counts[t["status"]] = counts.get(t["status"], 0) + 1
         if t["id"] == running_id:
             current_domain = t["domain"]
 
     summary = {
-        "total": len(items),
+        "total": len(snapshots),
         "queued": counts["queued"],
         "running": counts["running"],
         "done": counts["done"],
@@ -193,22 +197,20 @@ def api_tasks():
         "current_domain": current_domain,
     }
 
-    out = []
-    for t in items:
-        v = task_view(t)
+    for t in snapshots:
         if t["status"] == "queued":
-            v["position"] = pos.get(t["id"])
-        out.append(v)
-    return jsonify({"summary": summary, "tasks": out})
+            t["position"] = pos.get(t["id"])
+    return jsonify({"summary": summary, "tasks": snapshots})
 
 
 @app.post("/api/tasks/<tid>/promote")
 def api_promote(tid):
     with tasks_lock:
         task = tasks.get(tid)
+        status = task["status"] if task else None
     if not task:
         abort(404)
-    if task["status"] != "queued":
+    if status != "queued":
         return jsonify({"error": "task is not queued"}), 400
     if not promote(tid):
         return jsonify({"error": "task not in queue"}), 400
@@ -219,9 +221,10 @@ def api_promote(tid):
 def api_task(tid):
     with tasks_lock:
         task = tasks.get(tid)
-    if not task:
+        view = task_view(task) if task else None
+    if view is None:
         abort(404)
-    return jsonify(task_view(task))
+    return jsonify(view)
 
 
 @app.get("/api/tasks/<tid>/download")
