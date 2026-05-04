@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import subprocess
@@ -16,7 +17,60 @@ DOMAIN_RE = re.compile(
     r"^(?=.{1,253}$)(?!-)[A-Za-z0-9-]{1,63}(?<!-)(\.(?!-)[A-Za-z0-9-]{1,63}(?<!-))+$"
 )
 SCAN_TIMEOUT = int(os.environ.get("SCAN_TIMEOUT", "1800"))
-SUBFINDER_BIN = os.environ.get("SUBFINDER_BIN", "subfinder")
+CONFIG_FILE = BASE_DIR / "config.json"
+
+config_lock = threading.Lock()
+config: dict = {"subfinder_bin": os.environ.get("SUBFINDER_BIN", "subfinder")}
+
+
+def load_config() -> None:
+    if not CONFIG_FILE.exists():
+        return
+    try:
+        data = json.loads(CONFIG_FILE.read_text())
+    except Exception:
+        return
+    bin_path = data.get("subfinder_bin")
+    if isinstance(bin_path, str) and bin_path.strip():
+        with config_lock:
+            config["subfinder_bin"] = bin_path.strip()
+
+
+def save_config() -> None:
+    with config_lock:
+        snapshot = dict(config)
+    CONFIG_FILE.write_text(json.dumps(snapshot, indent=2))
+
+
+def get_subfinder_bin() -> str:
+    with config_lock:
+        return config["subfinder_bin"]
+
+
+def probe_subfinder(path: str) -> dict:
+    result = {"bin": path, "ok": False, "version": None, "error": None}
+    try:
+        proc = subprocess.run(
+            [path, "-version"], capture_output=True, text=True, timeout=5,
+        )
+        out = (proc.stderr or proc.stdout or "").strip()
+        if proc.returncode == 0:
+            result["ok"] = True
+            result["version"] = out[:200] or "ok"
+        else:
+            result["error"] = (out or f"exit {proc.returncode}")[:200]
+    except FileNotFoundError:
+        result["error"] = "binary not found"
+    except subprocess.TimeoutExpired:
+        result["error"] = "probe timeout"
+    except PermissionError:
+        result["error"] = "permission denied"
+    except Exception as e:
+        result["error"] = str(e)[:200]
+    return result
+
+
+load_config()
 
 app = Flask(__name__)
 
@@ -82,9 +136,10 @@ def update_task(task: dict, **fields) -> None:
 def run_scan(task: dict) -> None:
     update_task(task, status="running", started_at=time.time())
     output_file = task["output_file"]
+    bin_path = get_subfinder_bin()
     try:
         proc = subprocess.run(
-            [SUBFINDER_BIN, "-d", task["domain"], "-o", output_file, "-silent"],
+            [bin_path, "-d", task["domain"], "-o", output_file, "-silent"],
             capture_output=True,
             text=True,
             timeout=SCAN_TIMEOUT,
@@ -102,7 +157,7 @@ def run_scan(task: dict) -> None:
         update_task(
             task,
             status="failed",
-            error=f"subfinder binary not found: {SUBFINDER_BIN} (set SUBFINDER_BIN to override)",
+            error=f"subfinder binary not found: {bin_path} (set it on the page or via SUBFINDER_BIN)",
         )
     except subprocess.TimeoutExpired:
         update_task(task, status="failed", error=f"scan timeout after {SCAN_TIMEOUT}s")
@@ -136,6 +191,33 @@ threading.Thread(target=worker, daemon=True).start()
 @app.route("/")
 def index():
     return render_template("index.html")
+
+
+@app.get("/api/config")
+def api_config_get():
+    probe_path = (request.args.get("bin") or "").strip()
+    bin_path = probe_path or get_subfinder_bin()
+    result = probe_subfinder(bin_path)
+    result["saved_bin"] = get_subfinder_bin()
+    return jsonify(result)
+
+
+@app.post("/api/config")
+def api_config_set():
+    data = request.get_json(silent=True) or request.form
+    bin_path = (data.get("subfinder_bin") or "").strip()
+    if not bin_path:
+        return jsonify({"error": "subfinder_bin is required"}), 400
+    probe = probe_subfinder(bin_path)
+    if not probe["ok"]:
+        return jsonify(probe), 400
+    with config_lock:
+        config["subfinder_bin"] = bin_path
+    try:
+        save_config()
+    except Exception as e:
+        return jsonify({"error": f"saved in memory but failed to persist: {e}"}), 500
+    return jsonify(probe)
 
 
 def parse_domains(raw) -> list[str]:

@@ -3,4 +3,5 @@ __pycache__/
 .venv/
 venv/
 results/*.txt
+config.json
 .DS_Store

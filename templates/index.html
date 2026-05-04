@@ -38,11 +38,35 @@
                    border-radius: 3px; cursor: pointer; }
     .promote-btn:hover { background: #2563eb; color: #fff; }
     .pos { color: #6b7280; font-size: 0.78em; margin-left: 0.3em; }
+    details.settings { background: #fafafa; border: 1px solid #e5e7eb;
+                       border-radius: 4px; padding: 0.4em 0.7em; margin-bottom: 1em;
+                       font-size: 0.9em; }
+    details.settings > summary { cursor: pointer; font-weight: 600;
+                                  list-style: none; }
+    details.settings > summary::-webkit-details-marker { display: none; }
+    .settings-row { display: flex; gap: 0.5em; margin-top: 0.6em; align-items: center; }
+    .settings-row input { flex: 1; padding: 0.4em 0.6em; font-size: 0.9em;
+                          font-family: ui-monospace, monospace;
+                          border: 1px solid #bbb; border-radius: 4px; }
+    .settings-row button { padding: 0.4em 0.9em; font-size: 0.9em; }
+    .bin-status { margin-top: 0.4em; font-size: 0.85em; word-break: break-all; }
+    .bin-status.ok  { color: #047857; }
+    .bin-status.bad { color: #b91c1c; }
   </style>
 </head>
 <body>
   <h1>Subfinder Web</h1>
   <div class="hint">支持一次输入多个域名，用空格、逗号或换行分隔；按提交顺序排队扫描。</div>
+
+  <details class="settings" id="settings">
+    <summary>subfinder 路径设置</summary>
+    <div class="settings-row">
+      <input id="bin-input" type="text" placeholder="/usr/local/bin/subfinder 或 subfinder">
+      <button id="bin-save" type="button">保存</button>
+      <button id="bin-test" type="button">检测</button>
+    </div>
+    <div id="bin-status" class="bin-status"></div>
+  </details>
 
   <form id="scan-form">
     <textarea id="domains" rows="4"
@@ -157,6 +181,57 @@ async function refresh() {
   } catch (e) { /* ignore transient errors */ }
 }
 
+const binInput = document.getElementById('bin-input');
+const binStatus = document.getElementById('bin-status');
+const settingsBox = document.getElementById('settings');
+
+function renderBinStatus(d) {
+  if (!d) { binStatus.textContent = ''; binStatus.className = 'bin-status'; return; }
+  if (d.ok) {
+    binStatus.className = 'bin-status ok';
+    binStatus.textContent = `✓ ${d.bin}  ${d.version || ''}`;
+  } else {
+    binStatus.className = 'bin-status bad';
+    binStatus.textContent = `✗ ${d.bin || ''}  ${d.error || ''}`;
+    settingsBox.open = true;
+  }
+}
+
+async function loadBin() {
+  try {
+    const r = await fetch('/api/config');
+    const d = await r.json();
+    if (!binInput.value) binInput.value = d.saved_bin || d.bin || '';
+    renderBinStatus(d);
+  } catch (e) {}
+}
+
+async function saveBin() {
+  const path = binInput.value.trim();
+  if (!path) return;
+  const r = await fetch('/api/config', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({subfinder_bin: path}),
+  });
+  const d = await r.json();
+  renderBinStatus(d);
+  if (r.ok) settingsBox.open = false;
+}
+
+async function testBin() {
+  const path = binInput.value.trim();
+  const url = path
+    ? '/api/config?bin=' + encodeURIComponent(path)
+    : '/api/config';
+  const r = await fetch(url);
+  renderBinStatus(await r.json());
+}
+
+document.getElementById('bin-save').addEventListener('click', saveBin);
+document.getElementById('bin-test').addEventListener('click', testBin);
+
+loadBin();
 refresh();
 setInterval(refresh, 2000);
 </script>
