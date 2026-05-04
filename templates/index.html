@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Subfinder Web</title>
+  <style>
+    body { font-family: -apple-system, "Segoe UI", "PingFang SC", sans-serif;
+           max-width: 960px; margin: 2em auto; padding: 0 1em; color: #222; }
+    h1 { font-size: 1.4em; margin-bottom: 0.3em; }
+    .hint { color: #666; font-size: 0.85em; margin-bottom: 1em; }
+    form { display: flex; gap: 0.5em; margin-bottom: 1.2em; }
+    input[type=text] { flex: 1; padding: 0.55em 0.7em; font-size: 1em;
+                       border: 1px solid #bbb; border-radius: 4px; }
+    button { padding: 0.55em 1.2em; font-size: 1em; cursor: pointer;
+             background: #2563eb; color: #fff; border: 0; border-radius: 4px; }
+    button:hover { background: #1d4ed8; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { padding: 0.5em 0.6em; border-bottom: 1px solid #eee;
+             text-align: left; font-size: 0.92em; vertical-align: top; }
+    th { background: #fafafa; }
+    .status-queued  { color: #6b7280; }
+    .status-running { color: #c2780b; }
+    .status-done    { color: #047857; }
+    .status-failed  { color: #b91c1c; }
+    .err { font-size: 0.78em; color: #b91c1c; word-break: break-all; }
+    a { color: #2563eb; }
+  </style>
+</head>
+<body>
+  <h1>Subfinder Web</h1>
+  <div class="hint">输入域名，提交后排队扫描，完成后可下载结果。</div>
+
+  <form id="scan-form">
+    <input id="domain" type="text" placeholder="example.com" autocomplete="off" required>
+    <button type="submit">扫描</button>
+  </form>
+
+  <table>
+    <thead>
+      <tr>
+        <th>域名</th><th>状态</th><th>子域数</th>
+        <th>创建时间</th><th>耗时</th><th>操作</th>
+      </tr>
+    </thead>
+    <tbody id="tasks"></tbody>
+  </table>
+
+<script>
+const form = document.getElementById('scan-form');
+const tbody = document.getElementById('tasks');
+
+function esc(s) {
+  return String(s ?? '').replace(/[&<>"']/g, c => ({
+    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+  }[c]));
+}
+function fmtTime(ts) { return ts ? new Date(ts*1000).toLocaleTimeString() : '-'; }
+function fmtDur(s, e) {
+  if (!s) return '-';
+  const end = e || Date.now()/1000;
+  return (end - s).toFixed(1) + 's';
+}
+
+form.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const input = document.getElementById('domain');
+  const domain = input.value.trim();
+  const res = await fetch('/api/scan', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({domain}),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    alert(err.error || '提交失败');
+    return;
+  }
+  input.value = '';
+  refresh();
+});
+
+async function refresh() {
+  try {
+    const res = await fetch('/api/tasks');
+    const data = await res.json();
+    tbody.innerHTML = data.map(t => `
+      <tr>
+        <td>${esc(t.domain)}</td>
+        <td class="status-${esc(t.status)}">
+          ${esc(t.status)}
+          ${t.error ? `<div class="err">${esc(t.error)}</div>` : ''}
+        </td>
+        <td>${t.count}</td>
+        <td>${fmtTime(t.created_at)}</td>
+        <td>${fmtDur(t.started_at, t.finished_at)}</td>
+        <td>${t.status === 'done'
+            ? `<a href="/api/tasks/${esc(t.id)}/download">下载</a>`
+            : ''}</td>
+      </tr>
+    `).join('');
+  } catch (e) { /* ignore transient errors */ }
+}
+
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>

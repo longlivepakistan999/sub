@@ -1,0 +1,156 @@
+import os
+import re
+import subprocess
+import threading
+import time
+import uuid
+from pathlib import Path
+from queue import Queue
+
+from flask import Flask, abort, jsonify, render_template, request, send_file
+
+BASE_DIR = Path(__file__).resolve().parent
+RESULTS_DIR = BASE_DIR / "results"
+RESULTS_DIR.mkdir(exist_ok=True)
+
+DOMAIN_RE = re.compile(
+    r"^(?=.{1,253}$)(?!-)[A-Za-z0-9-]{1,63}(?<!-)(\.(?!-)[A-Za-z0-9-]{1,63}(?<!-))+$"
+)
+SCAN_TIMEOUT = int(os.environ.get("SCAN_TIMEOUT", "1800"))
+
+app = Flask(__name__)
+
+tasks: dict[str, dict] = {}
+tasks_lock = threading.Lock()
+queue: Queue = Queue()
+
+
+def task_view(t: dict) -> dict:
+    return {
+        "id": t["id"],
+        "domain": t["domain"],
+        "status": t["status"],
+        "created_at": t["created_at"],
+        "started_at": t["started_at"],
+        "finished_at": t["finished_at"],
+        "count": t["count"],
+        "error": t["error"],
+    }
+
+
+def make_task(domain: str) -> dict:
+    tid = uuid.uuid4().hex[:12]
+    task = {
+        "id": tid,
+        "domain": domain,
+        "status": "queued",
+        "created_at": time.time(),
+        "started_at": None,
+        "finished_at": None,
+        "count": 0,
+        "error": None,
+        "output_file": str(RESULTS_DIR / f"{tid}_{domain}.txt"),
+    }
+    with tasks_lock:
+        tasks[tid] = task
+    return task
+
+
+def run_scan(task: dict) -> None:
+    task["status"] = "running"
+    task["started_at"] = time.time()
+    output_file = task["output_file"]
+    try:
+        proc = subprocess.run(
+            ["subfinder", "-d", task["domain"], "-o", output_file, "-silent"],
+            capture_output=True,
+            text=True,
+            timeout=SCAN_TIMEOUT,
+        )
+        if proc.returncode != 0:
+            task["status"] = "failed"
+            task["error"] = (proc.stderr or proc.stdout or "subfinder failed").strip()[:1000]
+            return
+        if os.path.exists(output_file):
+            with open(output_file) as f:
+                lines = [ln.strip() for ln in f if ln.strip()]
+            task["count"] = len(lines)
+        task["status"] = "done"
+    except FileNotFoundError:
+        task["status"] = "failed"
+        task["error"] = "subfinder binary not found in PATH"
+    except subprocess.TimeoutExpired:
+        task["status"] = "failed"
+        task["error"] = f"scan timeout after {SCAN_TIMEOUT}s"
+    except Exception as e:
+        task["status"] = "failed"
+        task["error"] = str(e)
+    finally:
+        task["finished_at"] = time.time()
+
+
+def worker() -> None:
+    while True:
+        tid = queue.get()
+        try:
+            with tasks_lock:
+                task = tasks.get(tid)
+            if task:
+                run_scan(task)
+        finally:
+            queue.task_done()
+
+
+threading.Thread(target=worker, daemon=True).start()
+
+
+@app.route("/")
+def index():
+    return render_template("index.html")
+
+
+@app.post("/api/scan")
+def api_scan():
+    data = request.get_json(silent=True) or request.form
+    domain = (data.get("domain") or "").strip().lower()
+    if not domain or not DOMAIN_RE.match(domain):
+        return jsonify({"error": "invalid domain"}), 400
+    task = make_task(domain)
+    queue.put(task["id"])
+    return jsonify(task_view(task)), 201
+
+
+@app.get("/api/tasks")
+def api_tasks():
+    with tasks_lock:
+        items = sorted(tasks.values(), key=lambda t: t["created_at"], reverse=True)
+    return jsonify([task_view(t) for t in items])
+
+
+@app.get("/api/tasks/<tid>")
+def api_task(tid):
+    with tasks_lock:
+        task = tasks.get(tid)
+    if not task:
+        abort(404)
+    return jsonify(task_view(task))
+
+
+@app.get("/api/tasks/<tid>/download")
+def download(tid):
+    with tasks_lock:
+        task = tasks.get(tid)
+    if not task:
+        abort(404)
+    if task["status"] != "done" or not os.path.exists(task["output_file"]):
+        abort(404)
+    return send_file(
+        task["output_file"],
+        as_attachment=True,
+        download_name=f"{task['domain']}-subdomains.txt",
+    )
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port, debug=False)
