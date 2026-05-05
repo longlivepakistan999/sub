@@ -154,13 +154,25 @@ def task_get(tid: str) -> dict | None:
     return dict(row) if row else None
 
 
-def task_update(tid: str, **fields) -> None:
+def task_update(tid: str, **fields) -> int:
     if not fields:
-        return
+        return 0
     cols = ", ".join(f"{k}=?" for k in fields)
     params = list(fields.values()) + [tid]
     with db_lock:
-        get_db().execute(f"UPDATE tasks SET {cols} WHERE id=?", params)
+        return get_db().execute(f"UPDATE tasks SET {cols} WHERE id=?", params).rowcount
+
+
+def task_update_if_status(tid: str, expected: str, **fields) -> int:
+    """Conditional UPDATE; returns rowcount (0 if status moved or row gone)."""
+    if not fields:
+        return 0
+    cols = ", ".join(f"{k}=?" for k in fields)
+    params = list(fields.values()) + [tid, expected]
+    with db_lock:
+        return get_db().execute(
+            f"UPDATE tasks SET {cols} WHERE id=? AND status=?", params
+        ).rowcount
 
 
 def task_delete(tid: str) -> int:
@@ -254,7 +266,12 @@ def run_scan(tid: str) -> None:
     output_file = task["output_file"]
     bin_path = get_subfinder_bin()
 
-    task_update(tid, status="running", started_at=time.time())
+    # Atomic queued -> running transition. If the row was deleted (or its
+    # status changed) between task_get and now, abort before launching
+    # subfinder so we don't scan a task that no longer exists and leak its
+    # output file onto disk.
+    if not task_update_if_status(tid, "queued", status="running", started_at=time.time()):
+        return
     try:
         try:
             proc = subprocess.Popen(
@@ -348,15 +365,19 @@ def recover_state() -> None:
         rows = db.execute(
             "SELECT id FROM tasks WHERE status='queued' ORDER BY created_at"
         ).fetchall()
+    re_enqueued = 0
     if rows:
         with pending_cv:
             for r in rows:
-                pending.append(r["id"])
-            pending_cv.notify_all()
-    if recovered_running or rows:
+                if r["id"] not in pending:
+                    pending.append(r["id"])
+                    re_enqueued += 1
+            if re_enqueued:
+                pending_cv.notify()
+    if recovered_running or re_enqueued:
         print(
             f"recovered: {recovered_running} running -> failed, "
-            f"{len(rows)} queued re-enqueued",
+            f"{re_enqueued} queued re-enqueued",
             file=sys.stderr,
         )
 
