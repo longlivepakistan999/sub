@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import hmac
 import json
 import os
 import re
@@ -11,7 +13,7 @@ import time
 import uuid
 from pathlib import Path
 
-from flask import Flask, abort, jsonify, render_template, request, send_file
+from flask import Flask, Response, abort, jsonify, render_template, request, send_file
 
 BASE_DIR = Path(__file__).resolve().parent
 RESULTS_DIR = BASE_DIR / "results"
@@ -22,6 +24,11 @@ DOMAIN_RE = re.compile(
 )
 SCAN_TIMEOUT = int(os.environ.get("SCAN_TIMEOUT", "1800"))
 CONFIG_FILE = BASE_DIR / "config.json"
+
+BASIC_AUTH_USER = os.environ.get("BASIC_AUTH_USER", "")
+BASIC_AUTH_PASS = os.environ.get("BASIC_AUTH_PASS", "")
+AUTH_ENABLED = bool(BASIC_AUTH_USER and BASIC_AUTH_PASS)
+AUTH_REALM = os.environ.get("BASIC_AUTH_REALM", "subfinder")
 
 config_lock = threading.Lock()
 config: dict = {"subfinder_bin": os.environ.get("SUBFINDER_BIN", "subfinder")}
@@ -90,6 +97,43 @@ def probe_subfinder(path: str) -> dict:
 load_config()
 
 app = Flask(__name__)
+
+
+def _check_basic_auth(header: str | None) -> bool:
+    if not header or not header.startswith("Basic "):
+        return False
+    try:
+        raw = base64.b64decode(header[6:], validate=True).decode("utf-8", "replace")
+    except Exception:
+        return False
+    user, sep, pwd = raw.partition(":")
+    if not sep:
+        return False
+    return hmac.compare_digest(user, BASIC_AUTH_USER) and hmac.compare_digest(
+        pwd, BASIC_AUTH_PASS
+    )
+
+
+@app.before_request
+def _basic_auth_gate():
+    if not AUTH_ENABLED:
+        return None
+    if _check_basic_auth(request.headers.get("Authorization")):
+        return None
+    return Response(
+        "Authentication required\n",
+        status=401,
+        headers={"WWW-Authenticate": f'Basic realm="{AUTH_REALM}"'},
+    )
+
+
+if AUTH_ENABLED:
+    print(f"basic auth enabled for user '{BASIC_AUTH_USER}'", file=sys.stderr)
+else:
+    print(
+        "basic auth disabled (set BASIC_AUTH_USER and BASIC_AUTH_PASS to enable)",
+        file=sys.stderr,
+    )
 
 tasks: dict[str, dict] = {}
 tasks_lock = threading.Lock()

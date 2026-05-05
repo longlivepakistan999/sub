@@ -2,6 +2,18 @@
 
 适用于本仓库 `app.py` 的 subfinder Web 界面。**重要：界面里的 "subfinder 路径设置" 等于让访问者执行任意二进制路径，必须只暴露在内网或加身份认证；不要直接挂公网。**
 
+## 鉴权（Basic Auth，二选一即可）
+
+应用内置了 Basic Auth，启动时设两个环境变量就开：
+
+```bash
+export BASIC_AUTH_USER=youruser
+export BASIC_AUTH_PASS='一个长一点的密码'
+# 可选：export BASIC_AUTH_REALM=subfinder
+```
+
+两个变量任一为空 = 关闭鉴权（保留本地裸跑的方便）。开启后浏览器会弹原生登录框，每个 HTTP 请求都校验。**如果同时在 nginx 层也加了 `auth_basic`，就只在外层加，避免要求登录两次。**
+
 ---
 
 ## 一、非宝塔部署（手动 / VPS）
@@ -57,6 +69,8 @@ User=www-data
 WorkingDirectory=/opt/subfinder-web
 Environment=SUBFINDER_BIN=/root/go/bin/subfinder
 Environment=SCAN_TIMEOUT=1800
+Environment=BASIC_AUTH_USER=youruser
+Environment=BASIC_AUTH_PASS=改成一个真实密码
 ExecStart=/opt/subfinder-web/.venv/bin/gunicorn \
     --workers 1 --threads 4 \
     --bind 127.0.0.1:5000 \
@@ -176,7 +190,7 @@ ls -l /root/go/bin/subfinder      # 记下这个路径，下面要填进网页
 | 端口 | `5000`（或别的没占用的） |
 | 启动参数 | gunicorn 时填 `--workers 1 --threads 4` —— **必须 workers=1** |
 | 安装依赖 | 勾上"使用 requirements.txt"，路径 `requirements.txt` |
-| 环境变量 | `SUBFINDER_BIN=/root/go/bin/subfinder`（上一步的路径）<br>`SCAN_TIMEOUT=1800` |
+| 环境变量 | `SUBFINDER_BIN=/root/go/bin/subfinder`（上一步的路径）<br>`SCAN_TIMEOUT=1800`<br>`BASIC_AUTH_USER=youruser`<br>`BASIC_AUTH_PASS=一个长密码` |
 
 提交。面板会建 venv → pip 装依赖 → supervisor 拉起来。等它显示"运行中"。
 
