@@ -2,6 +2,18 @@
 
 适用于本仓库 `app.py` 的 subfinder Web 界面。**重要：界面里的 "subfinder 路径设置" 等于让访问者执行任意二进制路径，必须只暴露在内网或加身份认证；不要直接挂公网。**
 
+## 数据存放位置
+
+| 文件/目录 | 内容 | 重启后 |
+|---|---|---|
+| `tasks.db` (+ `-wal`/`-shm`) | 任务记录（域名、状态、子域数、时间、错误） | 保留 |
+| `results/<id>_<domain>.txt` | 每次扫描的子域名输出 | 保留 |
+| `config.json` | subfinder 路径 | 保留 |
+
+**重启行为**：进程重启时，所有 `running` 状态的任务会被标记成 `failed`（错误信息 `server restarted while running`，因为子进程已经被一起杀掉），所有 `queued` 任务按提交顺序重新入队继续扫。已完成/失败/停止的任务原样保留可下载。
+
+备份只需要拷 `tasks.db` 和 `results/`；想清空历史就 `rm tasks.db results/*.txt`（停服后再做）。
+
 ## 鉴权（Basic Auth，二选一即可）
 
 应用内置了 Basic Auth，启动时设两个环境变量就开：

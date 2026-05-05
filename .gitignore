@@ -5,4 +5,7 @@ venv/
 results/*.txt
 config.json
 config.json.tmp
+tasks.db
+tasks.db-wal
+tasks.db-shm
 .DS_Store

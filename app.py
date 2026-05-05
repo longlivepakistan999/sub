@@ -6,6 +6,7 @@ import json
 import os
 import re
 import signal
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -24,6 +25,7 @@ DOMAIN_RE = re.compile(
 )
 SCAN_TIMEOUT = int(os.environ.get("SCAN_TIMEOUT", "1800"))
 CONFIG_FILE = BASE_DIR / "config.json"
+DB_FILE = BASE_DIR / "tasks.db"
 
 BASIC_AUTH_USER = os.environ.get("BASIC_AUTH_USER", "")
 BASIC_AUTH_PASS = os.environ.get("BASIC_AUTH_PASS", "")
@@ -94,7 +96,276 @@ def probe_subfinder(path: str) -> dict:
     return result
 
 
+# ---------------------------------------------------------------- persistence
+
+db_lock = threading.Lock()
+_db: sqlite3.Connection | None = None
+
+TASK_COLUMNS = (
+    "id", "domain", "status", "created_at", "started_at",
+    "finished_at", "count", "error", "output_file",
+)
+
+
+def get_db() -> sqlite3.Connection:
+    global _db
+    if _db is None:
+        conn = sqlite3.connect(str(DB_FILE), check_same_thread=False, isolation_level=None)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tasks (
+                id TEXT PRIMARY KEY,
+                domain TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                started_at REAL,
+                finished_at REAL,
+                count INTEGER NOT NULL DEFAULT 0,
+                error TEXT,
+                output_file TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_created ON tasks(created_at)")
+        _db = conn
+    return _db
+
+
+def task_insert(task: dict) -> None:
+    with db_lock:
+        get_db().execute(
+            "INSERT INTO tasks (id, domain, status, created_at, started_at, "
+            "finished_at, count, error, output_file) VALUES (?,?,?,?,?,?,?,?,?)",
+            (
+                task["id"], task["domain"], task["status"], task["created_at"],
+                task["started_at"], task["finished_at"], task["count"],
+                task["error"], task["output_file"],
+            ),
+        )
+
+
+def task_get(tid: str) -> dict | None:
+    with db_lock:
+        row = get_db().execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
+    return dict(row) if row else None
+
+
+def task_update(tid: str, **fields) -> None:
+    if not fields:
+        return
+    cols = ", ".join(f"{k}=?" for k in fields)
+    params = list(fields.values()) + [tid]
+    with db_lock:
+        get_db().execute(f"UPDATE tasks SET {cols} WHERE id=?", params)
+
+
+def task_delete(tid: str) -> int:
+    with db_lock:
+        return get_db().execute("DELETE FROM tasks WHERE id=?", (tid,)).rowcount
+
+
+def tasks_all() -> list[dict]:
+    with db_lock:
+        rows = get_db().execute(
+            "SELECT * FROM tasks ORDER BY created_at DESC"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+# --------------------------------------------------------- in-memory runtime
+
+pending: list[str] = []
+pending_cv = threading.Condition()
+current_tid: str | None = None
+
+# Per-task transient state that can't live in SQLite. Keyed by task id.
+proc_handles: dict[str, subprocess.Popen] = {}
+stop_requests: set[str] = set()
+runtime_lock = threading.Lock()
+
+
+def promote(tid: str) -> bool:
+    with pending_cv:
+        if tid in pending:
+            pending.remove(tid)
+            pending.insert(0, tid)
+            return True
+        return False
+
+
+def task_view(t: dict) -> dict:
+    return {k: t[k] for k in (
+        "id", "domain", "status", "created_at", "started_at",
+        "finished_at", "count", "error",
+    )}
+
+
+def make_task(domain: str) -> dict:
+    """Insert a new task and enqueue it atomically so concurrent readers
+    never see a task that's persisted but missing from `pending`."""
+    tid = uuid.uuid4().hex[:12]
+    task = {
+        "id": tid,
+        "domain": domain,
+        "status": "queued",
+        "created_at": time.time(),
+        "started_at": None,
+        "finished_at": None,
+        "count": 0,
+        "error": None,
+        "output_file": str(RESULTS_DIR / f"{tid}_{domain}.txt"),
+    }
+    with db_lock:
+        get_db().execute(
+            "INSERT INTO tasks (id, domain, status, created_at, started_at, "
+            "finished_at, count, error, output_file) VALUES (?,?,?,?,?,?,?,?,?)",
+            (
+                task["id"], task["domain"], task["status"], task["created_at"],
+                task["started_at"], task["finished_at"], task["count"],
+                task["error"], task["output_file"],
+            ),
+        )
+        with pending_cv:
+            pending.append(tid)
+            pending_cv.notify()
+    return task
+
+
+def kill_proc_group(proc: subprocess.Popen) -> None:
+    """SIGKILL the process group so children inheriting the pipes also die."""
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, OSError):
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+def run_scan(tid: str) -> None:
+    task = task_get(tid)
+    if not task:
+        return
+    domain = task["domain"]
+    output_file = task["output_file"]
+    bin_path = get_subfinder_bin()
+
+    task_update(tid, status="running", started_at=time.time())
+    try:
+        try:
+            proc = subprocess.Popen(
+                [bin_path, "-d", domain, "-o", output_file, "-silent"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                start_new_session=True,
+            )
+        except FileNotFoundError:
+            task_update(
+                tid,
+                status="failed",
+                error=f"subfinder binary not found: {bin_path} (set it on the page or via SUBFINDER_BIN)",
+            )
+            return
+
+        # Publish handle, then check whether stop was requested in the tiny
+        # window between dequeue and Popen.
+        with runtime_lock:
+            proc_handles[tid] = proc
+            stop_now = tid in stop_requests
+        if stop_now:
+            kill_proc_group(proc)
+        try:
+            stdout, stderr = proc.communicate(timeout=SCAN_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            kill_proc_group(proc)
+            try:
+                proc.communicate(timeout=5)
+            except Exception:
+                pass
+            task_update(tid, status="failed", error=f"scan timeout after {SCAN_TIMEOUT}s")
+            return
+
+        with runtime_lock:
+            was_stopped = tid in stop_requests
+        if was_stopped:
+            task_update(tid, status="stopped", error="cancelled by user")
+            return
+        if proc.returncode != 0:
+            err = (stderr or stdout or "subfinder failed").strip()[:1000]
+            task_update(tid, status="failed", error=err)
+            return
+        if not os.path.exists(output_file):
+            open(output_file, "w").close()
+        with open(output_file) as f:
+            lines = [ln.strip() for ln in f if ln.strip()]
+        task_update(tid, count=len(lines), status="done")
+    except Exception as e:
+        task_update(tid, status="failed", error=str(e))
+    finally:
+        with runtime_lock:
+            proc_handles.pop(tid, None)
+            stop_requests.discard(tid)
+        task_update(tid, finished_at=time.time())
+
+
+def worker() -> None:
+    global current_tid
+    while True:
+        tid = None
+        try:
+            with pending_cv:
+                while not pending:
+                    pending_cv.wait()
+                tid = pending.pop(0)
+                current_tid = tid
+            try:
+                run_scan(tid)
+            finally:
+                with pending_cv:
+                    current_tid = None
+        except Exception as e:
+            print(f"worker error processing tid={tid}: {e!r}", file=sys.stderr)
+
+
+def recover_state() -> None:
+    """Bring DB and queue back to a consistent state after a restart:
+    any task left as 'running' has a dead subprocess, so mark it failed;
+    any 'queued' task is re-enqueued in original creation order."""
+    now = time.time()
+    with db_lock:
+        db = get_db()
+        cur = db.execute(
+            "UPDATE tasks SET status='failed', error='server restarted while running', "
+            "finished_at=? WHERE status='running'",
+            (now,),
+        )
+        recovered_running = cur.rowcount
+        rows = db.execute(
+            "SELECT id FROM tasks WHERE status='queued' ORDER BY created_at"
+        ).fetchall()
+    if rows:
+        with pending_cv:
+            for r in rows:
+                pending.append(r["id"])
+            pending_cv.notify_all()
+    if recovered_running or rows:
+        print(
+            f"recovered: {recovered_running} running -> failed, "
+            f"{len(rows)} queued re-enqueued",
+            file=sys.stderr,
+        )
+
+
+# ----------------------------------------------------------------- bootstrap
+
 load_config()
+get_db()
+recover_state()
 
 app = Flask(__name__)
 
@@ -134,161 +405,6 @@ else:
         "basic auth disabled (set BASIC_AUTH_USER and BASIC_AUTH_PASS to enable)",
         file=sys.stderr,
     )
-
-tasks: dict[str, dict] = {}
-tasks_lock = threading.Lock()
-
-pending: list[str] = []
-pending_cv = threading.Condition()
-current_tid: str | None = None
-
-
-def promote(tid: str) -> bool:
-    with pending_cv:
-        if tid in pending:
-            pending.remove(tid)
-            pending.insert(0, tid)
-            return True
-        return False
-
-
-def task_view(t: dict) -> dict:
-    return {
-        "id": t["id"],
-        "domain": t["domain"],
-        "status": t["status"],
-        "created_at": t["created_at"],
-        "started_at": t["started_at"],
-        "finished_at": t["finished_at"],
-        "count": t["count"],
-        "error": t["error"],
-    }
-
-
-def make_task(domain: str) -> dict:
-    """Register a new task and enqueue it atomically so concurrent readers
-    never see a task that exists in `tasks` but is missing from `pending`."""
-    tid = uuid.uuid4().hex[:12]
-    task = {
-        "id": tid,
-        "domain": domain,
-        "status": "queued",
-        "created_at": time.time(),
-        "started_at": None,
-        "finished_at": None,
-        "count": 0,
-        "error": None,
-        "output_file": str(RESULTS_DIR / f"{tid}_{domain}.txt"),
-    }
-    with tasks_lock:
-        tasks[tid] = task
-        with pending_cv:
-            pending.append(tid)
-            pending_cv.notify()
-    return task
-
-
-def update_task(task: dict, **fields) -> None:
-    with tasks_lock:
-        task.update(fields)
-
-
-def kill_proc_group(proc: subprocess.Popen) -> None:
-    """SIGKILL the process group so children inheriting the pipes also die."""
-    try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-    except (ProcessLookupError, OSError):
-        try:
-            proc.kill()
-        except Exception:
-            pass
-
-
-def run_scan(task: dict) -> None:
-    update_task(task, status="running", started_at=time.time())
-    output_file = task["output_file"]
-    bin_path = get_subfinder_bin()
-    try:
-        try:
-            proc = subprocess.Popen(
-                [bin_path, "-d", task["domain"], "-o", output_file, "-silent"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                start_new_session=True,
-            )
-        except FileNotFoundError:
-            update_task(
-                task,
-                status="failed",
-                error=f"subfinder binary not found: {bin_path} (set it on the page or via SUBFINDER_BIN)",
-            )
-            return
-
-        # Publish proc handle, then check whether stop was requested in
-        # the tiny window between dequeue and Popen.
-        with tasks_lock:
-            task["_proc"] = proc
-            stop_now = task.get("_stop_requested", False)
-        if stop_now:
-            kill_proc_group(proc)
-        try:
-            stdout, stderr = proc.communicate(timeout=SCAN_TIMEOUT)
-        except subprocess.TimeoutExpired:
-            kill_proc_group(proc)
-            try:
-                proc.communicate(timeout=5)
-            except Exception:
-                pass
-            update_task(task, status="failed", error=f"scan timeout after {SCAN_TIMEOUT}s")
-            return
-
-        with tasks_lock:
-            was_stopped = task.get("_stop_requested", False)
-        if was_stopped:
-            update_task(task, status="stopped", error="cancelled by user")
-            return
-        if proc.returncode != 0:
-            err = (stderr or stdout or "subfinder failed").strip()[:1000]
-            update_task(task, status="failed", error=err)
-            return
-        if not os.path.exists(output_file):
-            open(output_file, "w").close()
-        with open(output_file) as f:
-            lines = [ln.strip() for ln in f if ln.strip()]
-        update_task(task, count=len(lines), status="done")
-    except Exception as e:
-        update_task(task, status="failed", error=str(e))
-    finally:
-        with tasks_lock:
-            task.pop("_proc", None)
-            task.pop("_stop_requested", None)
-        update_task(task, finished_at=time.time())
-
-
-def worker() -> None:
-    global current_tid
-    while True:
-        tid = None
-        try:
-            with pending_cv:
-                while not pending:
-                    pending_cv.wait()
-                tid = pending.pop(0)
-                current_tid = tid
-            try:
-                with tasks_lock:
-                    task = tasks.get(tid)
-                if task:
-                    run_scan(task)
-            finally:
-                with pending_cv:
-                    current_tid = None
-        except Exception as e:
-            # Never let the worker thread die — without it queued tasks
-            # would silently stop processing while the server stayed up.
-            print(f"worker error processing tid={tid}: {e!r}", file=sys.stderr)
-
 
 threading.Thread(target=worker, daemon=True).start()
 
@@ -363,9 +479,7 @@ def api_scan():
 
 @app.get("/api/tasks")
 def api_tasks():
-    with tasks_lock:
-        snapshots = [task_view(t) for t in tasks.values()]
-    snapshots.sort(key=lambda t: t["created_at"], reverse=True)
+    snapshots = tasks_all()
     with pending_cv:
         order = list(pending)
         running_id = current_tid
@@ -398,32 +512,31 @@ def api_tasks():
         "current_domain": current_domain,
     }
 
+    out = []
     for t in snapshots:
+        v = task_view(t)
         if t["status"] == "queued":
-            t["position"] = pos.get(t["id"])
-    return jsonify({"summary": summary, "tasks": snapshots})
+            v["position"] = pos.get(t["id"])
+        out.append(v)
+    return jsonify({"summary": summary, "tasks": out})
 
 
 @app.post("/api/tasks/<tid>/promote")
 def api_promote(tid):
-    with tasks_lock:
-        task = tasks.get(tid)
-        status = task["status"] if task else None
+    task = task_get(tid)
     if not task:
         abort(404)
-    if status != "queued" or not promote(tid):
+    if task["status"] != "queued" or not promote(tid):
         return jsonify({"error": "task is no longer queued (already running or finished)"}), 400
     return jsonify({"ok": True})
 
 
 @app.post("/api/tasks/<tid>/stop")
 def api_stop(tid):
-    with tasks_lock:
-        task = tasks.get(tid)
-        if not task:
-            abort(404)
-        status = task["status"]
-    if status not in ("queued", "running"):
+    task = task_get(tid)
+    if not task:
+        abort(404)
+    if task["status"] not in ("queued", "running"):
         return jsonify({"error": "task is not active"}), 400
 
     # Try cancelling from the queue first.
@@ -433,22 +546,22 @@ def api_stop(tid):
             pending.remove(tid)
             removed = True
     if removed:
-        update_task(
-            task,
+        task_update(
+            tid,
             status="stopped",
             error="cancelled before start",
             finished_at=time.time(),
         )
         return jsonify({"ok": True})
 
-    # Already running (or just dequeued). Re-check status under the lock
-    # so we don't strand a stale flag on a task the worker just finalized.
-    with tasks_lock:
-        if task["status"] in ("queued", "running"):
-            task["_stop_requested"] = True
-            proc = task.get("_proc")
-        else:
-            proc = None
+    # Already running (or just dequeued). Re-check status before flagging
+    # so the request to stop never lingers on a task the worker just finalized.
+    fresh = task_get(tid)
+    proc = None
+    if fresh and fresh["status"] in ("queued", "running"):
+        with runtime_lock:
+            stop_requests.add(tid)
+            proc = proc_handles.get(tid)
     if proc is not None:
         kill_proc_group(proc)
     return jsonify({"ok": True})
@@ -456,22 +569,20 @@ def api_stop(tid):
 
 @app.delete("/api/tasks/<tid>")
 def api_delete(tid):
-    with tasks_lock:
-        task = tasks.get(tid)
-        if not task:
-            abort(404)
-        status = task["status"]
-        output_file = task.get("output_file")
-    if status == "running":
+    task = task_get(tid)
+    if not task:
+        abort(404)
+    if task["status"] == "running":
         return jsonify({"error": "stop the task before deleting"}), 400
 
-    if status == "queued":
+    if task["status"] == "queued":
         with pending_cv:
             try:
                 pending.remove(tid)
             except ValueError:
                 pass
 
+    output_file = task.get("output_file")
     if output_file:
         try:
             os.unlink(output_file)
@@ -480,36 +591,29 @@ def api_delete(tid):
         except OSError:
             pass
 
-    with tasks_lock:
-        # Re-check: if a race made it 'running' between our checks, refuse.
-        cur = tasks.get(tid)
-        if cur and cur["status"] == "running":
-            return jsonify({"error": "task started running; stop it first"}), 400
-        tasks.pop(tid, None)
+    # Re-check: if a race made it 'running' between our checks, refuse.
+    fresh = task_get(tid)
+    if fresh and fresh["status"] == "running":
+        return jsonify({"error": "task started running; stop it first"}), 400
+    task_delete(tid)
     return jsonify({"ok": True})
 
 
 @app.get("/api/tasks/<tid>")
 def api_task(tid):
-    with tasks_lock:
-        task = tasks.get(tid)
-        view = task_view(task) if task else None
-    if view is None:
+    task = task_get(tid)
+    if not task:
         abort(404)
-    return jsonify(view)
+    return jsonify(task_view(task))
 
 
 @app.get("/api/tasks/<tid>/download")
 def download(tid):
-    with tasks_lock:
-        task = tasks.get(tid)
-        if task and task["status"] == "done":
-            output_file = task["output_file"]
-            download_name = f"{task['domain']}-subdomains.txt"
-        else:
-            output_file = None
-    if not output_file:
+    task = task_get(tid)
+    if not task or task["status"] != "done":
         abort(404)
+    output_file = task["output_file"]
+    download_name = f"{task['domain']}-subdomains.txt"
     try:
         return send_file(output_file, as_attachment=True, download_name=download_name)
     except FileNotFoundError:
